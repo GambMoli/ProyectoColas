@@ -55,17 +55,14 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
   // -------- Estado interno de simulación (refs) --------
   const simTime = useRef(0)
   const nextArrivalAt = useRef(0)
-  const busyUntil = useRef<(number | null)[]>([])
   const totalWait = useRef(0)
   const scheduleIdx = useRef(0)
 
-  // Lista "real" de pasajeros (se muta en el loop)
-  const passengersRef = useRef<Passenger[]>([])
+  // secuencia estable de llegada (para evitar flicker por sort inestable)
+  const nextArrivalSeq = useRef(0)
 
-  // Mantener ref sincronizada cuando cambia el estado (no crítico, pero útil)
-  useEffect(() => {
-    passengersRef.current = passengers
-  }, [passengers])
+  // Lista "real" de pasajeros (se muta en el loop y es fuente de verdad)
+  const passengersRef = useRef<Passenger[]>([])
 
   // Geometría cabinas y cola
   const boothSpacing = 4.0
@@ -94,10 +91,15 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
   )
 
   const snakePath = useMemo(() => buildSnakePath(snakeCfg), [snakeCfg])
-
   const queueTargetForIndex = (idx: number): [number, number, number] => {
     const d = idx * spacing + 0.0001
     return samplePolyline(snakePath, Math.min(d, 9999))
+  }
+
+  // comparador estable por llegada (tiempo + secuencia)
+  const byArrival = (a: any, b: any) => {
+    if (a.arrivalAt !== b.arrivalAt) return a.arrivalAt - b.arrivalAt
+    return (a.arrivalSeq ?? 0) - (b.arrivalSeq ?? 0)
   }
 
   // ---------------- INIT ----------------
@@ -116,35 +118,31 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
     passengersRef.current = []
     simTime.current = 0
     totalWait.current = 0
-    busyUntil.current = Array(serverCount).fill(null)
     scheduleIdx.current = 0
+    nextArrivalSeq.current = 0
 
     setPaused(false)
     setShowConclusion(false)
     setAutoConclusionShown(false)
 
     if (hasSchedule && arrivalsSchedule) {
-      // Usar primer arrival del Excel
+      // Primera llegada programada
       nextArrivalAt.current = arrivalsSchedule[0]
+      // Fast-forward si la primera llegada está "lejos"
+      if (nextArrivalAt.current > 5) {
+        simTime.current = Math.max(0, nextArrivalAt.current - 0.05)
+      }
     } else {
       // Primera llegada Poisson
       const lambdaPerSec = lambdaPerMin / 60
       nextArrivalAt.current = expSample(lambdaPerSec)
-
-      // Fast-forward si la primera llegada está lejos
+      // Fast-forward si está lejos
       if (nextArrivalAt.current > 5) {
         simTime.current = Math.max(0, nextArrivalAt.current - 0.05)
       }
     }
-
-    console.log('[Simulation:init]', {
-      resetVersion,
-      lambdaPerMin,
-      serverCount,
-      firstArrivalSec: nextArrivalAt.current,
-      hasSchedule
-    })
-  }, [resetVersion, lambdaPerMin, serverCount, hasSchedule, arrivalsSchedule])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetVersion, lambdaPerMin, serverCount, hasSchedule])
 
   // ---------------- MÉTRICAS TEÓRICAS (M/G/1) ----------------
   const meanServiceMin = serviceMeanSec / 60
@@ -174,32 +172,45 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
     if (paused) return
 
     const dt = Math.min(deltaReal, 0.05)
-
-    // Avanzar tiempo de simulación
     simTime.current += dt * simSpeed
     const now = simTime.current
 
-    const list = passengersRef.current
+    // Copia mutable de la lista "real" (ref es fuente de verdad)
+    let list = passengersRef.current
 
-    // 1) Completar servicios vencidos
+    // 1) Completar servicios vencidos basándonos SOLO en serviceEndAt
+    const kept: Passenger[] = []
     let completedDelta = 0
     const newWaits: number[] = []
 
-    for (let s = 0; s < serverCount; s++) {
-      const due = busyUntil.current[s]
-      if (due != null && now >= due) {
-        const idx = list.findIndex(p => p.state === 'service' && p.serverIdx === s)
-        if (idx !== -1) {
-          const job = list[idx]
-          const wait = (job.serviceStartAt ?? now) - job.arrivalAt
-          totalWait.current += wait
-          newWaits.push(wait)
-          list.splice(idx, 1)
-          completedDelta++
+    // también construiremos ocupación y tiempos de fin por servidor
+    const serverOccupied = new Array<boolean>(serverCount).fill(false)
+    const serviceEndAtByServer = new Array<number | null>(serverCount).fill(null)
+
+    for (const p of list) {
+      if (
+        p.state === 'service' &&
+        p.serverIdx != null &&
+        p.serviceEndAt != null &&
+        now >= p.serviceEndAt
+      ) {
+        // este pasajero termina y sale del sistema
+        const wait = Math.max(0, (p.serviceStartAt ?? now) - p.arrivalAt)
+        totalWait.current += wait
+        newWaits.push(wait)
+        completedDelta++
+        // NO lo metemos en kept -> desaparece de la escena
+      } else {
+        kept.push(p)
+        if (p.state === 'service' && p.serverIdx != null && p.serviceEndAt != null) {
+          serverOccupied[p.serverIdx] = true
+          serviceEndAtByServer[p.serverIdx] = p.serviceEndAt
         }
-        busyUntil.current[s] = null
       }
     }
+
+    list = kept
+    passengersRef.current = list
 
     if (completedDelta > 0) {
       setCompleted(c => {
@@ -236,15 +247,22 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
             ? serviceTimesSchedule[scheduleIdx.current]
             : undefined
 
+        const fixedService =
+          typeof serviceTimeFromSchedule === 'number' && isFinite(serviceTimeFromSchedule)
+            ? Math.max(serviceTimeFromSchedule, 0.1)
+            : undefined
+
         list.push({
           id: Date.now() + Math.random(),
           state: 'queue',
           pos,
           arrivalAt: arrTime,
           appearance: style,
-          // campo opcional con duración fija de servicio
-          // @ts-expect-error
-          serviceTimeSec: serviceTimeFromSchedule
+          // secuencia estable para orden de cola
+          //@ts-ignore
+          arrivalSeq: nextArrivalSeq.current++,
+          //@ts-ignore
+          serviceTimeSec: fixedService
         } as Passenger)
 
         scheduleIdx.current += 1
@@ -274,7 +292,9 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
           state: 'queue',
           pos,
           arrivalAt: now,
-          appearance: style
+          appearance: style,
+          //@ts-ignore
+          arrivalSeq: nextArrivalSeq.current++
         } as Passenger)
 
         nextArrivalAt.current += expSample(lambdaPerSec)
@@ -282,40 +302,48 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
     }
 
     // 3) Asignación a servidores libres
-    for (let s = 0; s < serverCount; s++) {
-      if (busyUntil.current[s] != null) continue
-      const idxQ = list.findIndex(p => p.state === 'queue')
-      if (idxQ !== -1) {
-        const job: any = list[idxQ]
-        let sTime = lognormalSample(serviceMeanSec, serviceCV)
-
-        // Si el pasajero trae duración fija desde Excel, usarla
-        if (typeof job.serviceTimeSec === 'number' && job.serviceTimeSec > 0) {
-          sTime = job.serviceTimeSec
-        }
-
-        job.state = 'service'
-        job.serverIdx = s
-        job.serviceStartAt = now
-        job.serviceEndAt = now + sTime
-        busyUntil.current[s] = job.serviceEndAt
-      }
-    }
-
-    // 4) Movimiento en cola (orden FIFO por llegada)
     const queue = list
       .filter(p => p.state === 'queue')
-      .sort((a, b) => a.arrivalAt - b.arrivalAt)
+      .sort(byArrival) // orden estable
 
+    let queueCursor = 0
+    for (let s = 0; s < serverCount; s++) {
+      if (serverOccupied[s]) continue
+      if (queueCursor >= queue.length) break
+
+      const job: any = queue[queueCursor++]
+
+      let sTime = lognormalSample(serviceMeanSec, serviceCV)
+      if (!Number.isFinite(sTime) || sTime <= 0) {
+        sTime = Math.max(serviceMeanSec, 0.1)
+      }
+      if (typeof job.serviceTimeSec === 'number' && isFinite(job.serviceTimeSec) && job.serviceTimeSec > 0) {
+        sTime = Math.max(job.serviceTimeSec, 0.1)
+      }
+
+      job.state = 'service'
+      job.serverIdx = s
+      job.serviceStartAt = now
+      job.serviceEndAt = now + sTime
+
+      serverOccupied[s] = true
+      serviceEndAtByServer[s] = job.serviceEndAt
+    }
+
+    // 4) Movimiento en cola (FIFO por llegada estable)
     const moveQueueFactor = Math.min(1, 0.15 * simSpeed)
     const moveServiceFactor = Math.min(1, 0.2 * simSpeed)
 
-    queue.forEach((p, i) => {
+    const queueAfterAssign = list
+      .filter(p => p.state === 'queue')
+      .sort(byArrival)
+
+    queueAfterAssign.forEach((p, i) => {
       const target = queueTargetForIndex(i)
       p.pos = lerp3(p.pos, target, moveQueueFactor)
     })
 
-    // 5) Movimiento hacia cabina cuando están en servicio
+    // 5) Movimiento hacia cabina en servicio
     list.forEach(p => {
       if (p.state === 'service' && p.serverIdx != null) {
         const stand = servicePositions[p.serverIdx]
@@ -324,20 +352,18 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
       }
     })
 
-    // 6) Actualizar HUD y estado visible SIEMPRE
+    // 6) Actualizar HUD / estado visible
     setSimClockSec(now)
 
     const tNext = nextArrivalAt.current - now
-    setTimeToNextArrival(
-      Number.isFinite(tNext) ? Math.max(tNext, 0) : null
-    )
+    setTimeToNextArrival(Number.isFinite(tNext) ? Math.max(tNext, 0) : null)
 
-    const remaining = busyUntil.current.map(due =>
+    const remaining = serviceEndAtByServer.map(due =>
       due != null ? Math.max(due - now, 0) : 0
     )
     setServiceRemaining(remaining)
 
-    // Aquí es donde se sincroniza la vista: con esto no se quedan "pegados"
+    // snapshot para React
     setPassengers(list.slice())
   })
 
@@ -347,15 +373,11 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
     [passengers]
   )
 
-  const inServiceByServer = useMemo(() => {
-    const occ = Array(serverCount).fill(false)
-    passengers.forEach(p => {
-      if (p.state === 'service' && p.serverIdx != null) {
-        occ[p.serverIdx] = true
-      }
-    })
-    return occ
-  }, [passengers, serverCount])
+  // ocupación visual de las cabinas derivada SOLO de serviceRemaining
+  const occupiedBooths = useMemo(
+    () => serviceRemaining.map(t => t > 0.05),
+    [serviceRemaining]
+  )
 
   const percentile95 = useMemo(() => {
     if (waitTimes.length < 20) return 0
@@ -381,7 +403,6 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
   const meanWaitMinObs = avgWait > 0 ? avgWait / 60 : 0
   const p95MinObs = percentile95 > 0 ? percentile95 / 60 : 0
 
-  // ---------------- Texto de conclusión ----------------
   const conclusionText = useMemo(() => {
     if (completed < 30) {
       return 'Aún no hay suficientes pasajeros procesados para una conclusión estable. Deja correr la simulación hasta que al menos 30–50 pasajeros hayan sido atendidos.'
@@ -398,62 +419,39 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
 
     let slaText = ''
     if (slaCompliance >= 95) {
-      slaText = `Se cumple cómodamente el SLA de ${slaTarget} minutos (≈ ${slaCompliance.toFixed(1)} % de los pasajeros esperan menos que ese tiempo).`
+      slaText = `Se cumple cómodamente el SLA de ${slaTarget} minutos (≈ ${slaCompliance.toFixed(1)} % dentro del objetivo).`
     } else if (slaCompliance >= 85) {
-      slaText = `Se está cerca de cumplir el SLA de ${slaTarget} minutos (≈ ${slaCompliance.toFixed(1)} % dentro del objetivo); bastaría con pequeños ajustes en la tasa de llegadas o en los tiempos de atención.`
+      slaText = `Se está cerca de cumplir el SLA de ${slaTarget} minutos (≈ ${slaCompliance.toFixed(1)} %); bastan pequeños ajustes.`
     } else {
-      slaText = `Con un SLA de ${slaTarget} minutos solo ≈ ${slaCompliance.toFixed(1)} % de los pasajeros quedan dentro del objetivo, por lo que el sistema lo incumple de forma sistemática.`
+      slaText = `Con un SLA de ${slaTarget} minutos solo ≈ ${slaCompliance.toFixed(1)} % de los pasajeros quedan dentro del objetivo.`
     }
 
     const queueText =
-      Lq === 0
-        ? 'Prácticamente no se observan colas visibles en el sistema.'
-        : Lq <= 5
-          ? 'Las colas observadas son cortas y tienden a disiparse rápidamente.'
-          : Lq <= 15
-            ? 'Se observan colas de tamaño medio, pero aún manejables para el personal de migración.'
-            : 'Se observan colas largas y persistentes, que pueden impactar de forma negativa la experiencia de los pasajeros.'
+      Lq === 0 ? 'Prácticamente no se observan colas visibles.' :
+      Lq <= 5 ? 'Colas cortas que se disipan rápido.' :
+      Lq <= 15 ? 'Colas de tamaño medio, aún manejables.' :
+      'Colas largas y persistentes que impactan la experiencia.'
 
     const mgx = serverCount === 1 ? 'M/G/1' : 'M/G/c'
-
     const lines: string[] = []
 
-    lines.push(
-      `Con ${completed} pasajeros procesados, el sistema ${mgx} opera con una tasa de llegada de ` +
-      `${lambdaPerMin.toFixed(2)} pasajeros/minuto y un tiempo medio de atención de ${(serviceMeanSec / 60).toFixed(2)} minutos.`
-    )
-
-    lines.push(
-      `Teóricamente, esto produce una intensidad de tráfico ρ ≈ ${rhoTheo.toFixed(2)}, lo que indica que la cabina está ${loadDesc}`
-    )
-
-    lines.push(
-      `En la simulación, el tiempo medio de espera observado es de ${meanWaitMinObs.toFixed(2)} minutos y el percentil 95 ronda los ${p95MinObs.toFixed(2)} minutos.`
-    )
-
+    lines.push(`Con ${completed} pasajeros, el sistema ${mgx} opera con λ=${lambdaPerMin.toFixed(2)} pax/min y E[S]=${(serviceMeanSec/60).toFixed(2)} min.`)
+    lines.push(`Teóricamente, ρ ≈ ${rhoTheo.toFixed(2)}, cabina ${loadDesc}`)
+    lines.push(`En la simulación: Wq medio ≈ ${meanWaitMinObs.toFixed(2)} min; P95 ≈ ${p95MinObs.toFixed(2)} min.`)
     lines.push(slaText)
     lines.push(queueText)
 
     if (rhoTheo >= 1) {
-      lines.push(
-        'Interpretación: con estos parámetros el modelo M/G/1 describe un sistema saturado. ' +
-        'Para que el sistema sea estable, en la práctica habría que reducir la tasa de llegada de pasajeros (λ) o incrementar la capacidad de servicio.'
-      )
+      lines.push('Interpretación: con estos parámetros el sistema está saturado. Se requiere bajar λ o aumentar capacidad.')
     } else {
-      lines.push(
-        'Interpretación: estos resultados sirven para argumentar en tu documento si la configuración actual del control migratorio es suficiente ' +
-        'o si conviene ajustar la llegada de pasajeros (λ), reorganizar la cola o aumentar la capacidad de servicio.'
-      )
+      lines.push('Interpretación: los resultados orientan si la configuración actual es suficiente o conviene ajustar λ / reorganizar / aumentar c.')
     }
-
     return lines.join(' ')
   }, [avgWait, completed, lambdaPerMin, percentile95, rhoTheo, slaCompliance, slaTarget, serviceMeanSec, Lq, serverCount, meanWaitMinObs, p95MinObs])
 
-  // ---------------- Reporte imprimible ----------------
   const generateReport = () => {
     const win = window.open('', '_blank', 'width=900,height=700')
     if (!win) return
-
     win.document.write(`<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -469,43 +467,41 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
 </head>
 <body>
   <h1>Reporte de Simulación – Control Migratorio</h1>
-  <p>Escenario simulado con el modelo M/G/1 a partir de los parámetros obtenidos en la fase de verificación y validación.</p>
+  <p>Escenario simulado con el modelo M/G/1 a partir de los parámetros obtenidos.</p>
 
   <h2>Parámetros de entrada</h2>
   <table>
     <tr><th>Parámetro</th><th>Valor</th></tr>
-    <tr><td>Tasa de llegada λ</td><td>${lambdaPerMin.toFixed(3)} pasajeros/minuto</td></tr>
-    <tr><td>Tiempo medio de servicio E[S]</td><td>${serviceMeanSec.toFixed(2)} s (${meanServiceMin.toFixed(3)} min)</td></tr>
-    <tr><td>Coeficiente de variación del servicio (CV)</td><td>${serviceCV.toFixed(2)}</td></tr>
-    <tr><td>Tasa de servicio μ</td><td>${mu.toFixed(2)} pasajeros/minuto</td></tr>
-    <tr><td>Número de servidores</td><td>${serverCount}</td></tr>
-    <tr><td>Objetivo de SLA</td><td>${slaTarget} minutos</td></tr>
+    <tr><td>Tasa de llegada λ</td><td>${lambdaPerMin.toFixed(3)} pax/min</td></tr>
+    <tr><td>E[S]</td><td>${serviceMeanSec.toFixed(2)} s (${meanServiceMin.toFixed(3)} min)</td></tr>
+    <tr><td>CV servicio</td><td>${serviceCV.toFixed(2)}</td></tr>
+    <tr><td>μ</td><td>${mu.toFixed(2)} pax/min</td></tr>
+    <tr><td>Servidores</td><td>${serverCount}</td></tr>
+    <tr><td>SLA</td><td>${slaTarget} min</td></tr>
   </table>
 
-  <h2>Indicadores teóricos (modelo M/G/1)</h2>
+  <h2>Indicadores teóricos (M/G/1)</h2>
   <table>
     <tr><th>Indicador</th><th>Valor</th></tr>
-    <tr><td>Intensidad del sistema ρ</td><td>${rhoTheo.toFixed(2)}</td></tr>
-    <tr><td>Longitud media de la cola Lq</td><td>${LqTheo.toFixed(2)} pasajeros</td></tr>
-    <tr><td>Tiempo medio de espera en cola Wq</td><td>${(WqTheoMin * 60).toFixed(1)} s (${WqTheoMin.toFixed(3)} min)</td></tr>
-    <tr><td>Longitud media del sistema L</td><td>${LTheo.toFixed(2)} pasajeros</td></tr>
-    <tr><td>Tiempo medio total en el sistema W</td><td>${(WTheoMin * 60).toFixed(1)} s (${WTheoMin.toFixed(3)} min)</td></tr>
-    <tr><td>Probabilidad de sistema vacío P₀</td><td>${(P0 * 100).toFixed(1)} %</td></tr>
+    <tr><td>ρ</td><td>${rhoTheo.toFixed(2)}</td></tr>
+    <tr><td>Lq</td><td>${LqTheo.toFixed(2)} pax</td></tr>
+    <tr><td>Wq</td><td>${(WqTheoMin * 60).toFixed(1)} s (${WqTheoMin.toFixed(3)} min)</td></tr>
+    <tr><td>L</td><td>${LTheo.toFixed(2)} pax</td></tr>
+    <tr><td>W</td><td>${(WTheoMin * 60).toFixed(1)} s (${WTheoMin.toFixed(3)} min)</td></tr>
+    <tr><td>P₀</td><td>${(P0 * 100).toFixed(1)} %</td></tr>
   </table>
 
-  <h2>Indicadores observados en la simulación</h2>
+  <h2>Indicadores observados</h2>
   <table>
     <tr><th>Indicador</th><th>Valor</th></tr>
-    <tr><td>Pasajeros procesados</td><td>${completed}</td></tr>
-    <tr><td>Tiempo medio de espera observado</td><td>${(meanWaitMinObs * 60).toFixed(1)} s (${meanWaitMinObs.toFixed(3)} min)</td></tr>
-    <tr><td>Percentil 95 de espera observado</td><td>${(p95MinObs * 60).toFixed(1)} s (${p95MinObs.toFixed(3)} min)</td></tr>
-    <tr><td>Longitud instantánea de cola (Lq)</td><td>${Lq}</td></tr>
-    <tr><td>Cumplimiento de SLA</td><td>${slaCompliance.toFixed(1)} %</td></tr>
+    <tr><td>Procesados</td><td>${completed}</td></tr>
+    <tr><td>Wq medio observado</td><td>${(meanWaitMinObs * 60).toFixed(1)} s (${meanWaitMinObs.toFixed(3)} min)</td></tr>
+    <tr><td>P95 observado</td><td>${(p95MinObs * 60).toFixed(1)} s (${p95MinObs.toFixed(3)} min)</td></tr>
+    <tr><td>Lq instantáneo</td><td>${Lq}</td></tr>
+    <tr><td>Cumpl. SLA</td><td>${slaCompliance.toFixed(1)} %</td></tr>
   </table>
 
-  <p style="margin-top: 18px; font-size: 13px;">
-    Este reporte puede guardarse como PDF utilizando la opción de “Imprimir &gt; Guardar como PDF” del navegador.
-  </p>
+  <p style="margin-top: 18px; font-size: 13px;">Puedes imprimir y guardar como PDF desde el navegador.</p>
 </body>
 </html>`)
     win.document.close()
@@ -531,7 +527,7 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
         standZ={standZ}
         boothSpacing={boothSpacing}
         count={serverCount}
-        occupied={inServiceByServer}
+        occupied={occupiedBooths}
       />
       {passengers.map(p => (
         <PassengerMesh
@@ -552,7 +548,7 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
       <pointLight position={[0, 8, -15]} intensity={0.3} />
       <OrbitControls makeDefault maxPolarAngle={Math.PI / 2.1} minDistance={10} maxDistance={50} />
 
-      {/* HUD con botón de reporte + tiempos vivos */}
+      {/* HUD */}
       <HUD
         params={params}
         Lq={Lq}
@@ -566,10 +562,9 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
         simTimeSec={simClockSec}
         timeToNextArrival={timeToNextArrival}
         serviceRemaining={serviceRemaining}
-        serversBusy={inServiceByServer}
       />
 
-      {/* Tarjeta de conclusión automática */}
+      {/* Conclusión */}
       {showConclusion && (
         <Html fullscreen>
           <div
@@ -589,20 +584,10 @@ export default function Simulation({ params, resetVersion }: { params: SimParams
               lineHeight: 1.5
             }}
           >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: 6
-              }}
-            >
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom: 6 }}>
               <strong>Conclusión del escenario simulado</strong>
               <button
-                onClick={() => {
-                  setShowConclusion(false)
-                  setPaused(false)
-                }}
+                onClick={() => { setShowConclusion(false); setPaused(false) }}
                 style={{
                   padding: '2px 8px',
                   borderRadius: 999,

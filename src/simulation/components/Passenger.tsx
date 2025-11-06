@@ -2,15 +2,25 @@ import React, { useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { Group } from 'three'
 
-export default function Passenger({ position, inService }: { position: [number, number, number]; inService: boolean }) {
+export default function Passenger({
+  position,
+  inService
+}: {
+  position: [number, number, number]
+  inService: boolean
+}) {
   const ref = useRef<Group>(null!)
+
   useFrame((state) => {
     if (!ref.current) return
     const t = state.clock.elapsedTime
-    ref.current.position.y = inService ? 0 : Math.sin(t * 2 + ref.current.position.z) * 0.02
+    const [x, baseY, z] = position
+    const bob = inService ? 0 : Math.sin(t * 2 + z) * 0.02
+    ref.current.position.set(x, baseY + bob, z)
   })
+
   return (
-    <group ref={ref} position={position}>
+    <group ref={ref}>
       <mesh position={[0, 0.5, 0]} castShadow>
         <capsuleGeometry args={[0.18, 0.65, 8, 16]} />
         <meshStandardMaterial color="#3b82f6" roughness={0.7} />

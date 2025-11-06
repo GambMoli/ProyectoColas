@@ -16,8 +16,7 @@ export default function HUD({
   onReport,
   simTimeSec,
   timeToNextArrival,
-  serviceRemaining = [],
-  serversBusy
+  serviceRemaining = []
 }: {
   params: SimParams
   Lq: number
@@ -31,7 +30,6 @@ export default function HUD({
   simTimeSec?: number
   timeToNextArrival?: number | null
   serviceRemaining?: number[]
-  serversBusy?: boolean[]
 }) {
   const { lambdaPerMin, serviceMeanSec, serviceCV, simSpeed, serverCount } = params
   const mgx = serverCount === 1 ? 'M/G/1' : 'M/G/c'
@@ -41,15 +39,14 @@ export default function HUD({
   const nextArrivalLabel =
     timeToNextArrival != null
       ? (timeToNextArrival < 0.3
-          ? 'llegando…'
-          : timeToNextArrival < 10
-            ? `${timeToNextArrival.toFixed(1)} s`
-            : formatSec(timeToNextArrival))
+        ? 'llegando…'
+        : timeToNextArrival < 10
+          ? `${timeToNextArrival.toFixed(1)} s`
+          : formatSec(timeToNextArrival))
       : '–'
 
   return (
     <Html fullscreen>
-      {/* pointerEvents: 'auto' para poder hacer click en botones */}
       <div style={{ ...hudStyle, pointerEvents: 'auto' }}>
         <div style={headerStyle}>
           <h3 style={{ margin: 0, fontSize: '18px' }}>Control Migratorio</h3>
@@ -78,7 +75,7 @@ export default function HUD({
                 color:
                   rho > 0.95 ? '#ff6b6b'
                     : rho > 0.75 ? '#ffd43b'
-                    : '#51cf66'
+                      : '#51cf66'
               }}
             >
               {rho.toFixed(2)}
@@ -90,7 +87,6 @@ export default function HUD({
           <h4 style={sectionTitleStyle}>⏱️ Espera</h4>
           <div>Media (Wq): <b>{formatSec(avgWait)}</b></div>
           <div>P95: <b>{formatSec(percentile95)}</b></div>
-          <div>SLA: <b>{slaTarget} min</b></div>
           <div>
             Cumplimiento:{' '}
             <b
@@ -98,7 +94,7 @@ export default function HUD({
                 color:
                   slaCompliance >= 95 ? '#51cf66'
                     : slaCompliance >= 85 ? '#ffd43b'
-                    : '#ff6b6b'
+                      : '#ff6b6b'
               }}
             >
               {slaCompliance.toFixed(1)}%
@@ -114,7 +110,7 @@ export default function HUD({
           {serviceRemaining && serviceRemaining.length > 0 && (
             <div style={{ marginTop: 4, fontSize: 12 }}>
               {serviceRemaining.map((t, i) => {
-                const busy = serversBusy ? serversBusy[i] : t > 0.1
+                const busy = t > 0.05
                 let label: string
                 if (!busy) {
                   label = 'libre'
